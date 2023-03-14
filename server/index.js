@@ -2,6 +2,7 @@ const express = require("express");
 const app = express();
 const cors = require("cors");
 const http = require("http");
+const axios = require("axios");
 const server = http.createServer(app);
 const io = require("socket.io")(server);
 const PORT = 5000;
@@ -12,6 +13,7 @@ app.use(cors());
 app.use(express.json());
 const visits = [];
 const activeUsers = new Set();
+
 function getVisitorDevice(visitor) {
   const ua = visitor; // Assuming you have the visitor's user agent in the visitor object
 
@@ -54,65 +56,101 @@ const connect = async () => {
 
 app.get("/", async (req, res) => {
   // Record the visitor's information
-  const visit = {
+
+  const ip = req?.ip;
+
+  // Get user's location based on IP address
+  const locationResponse = await axios.get(
+    `https://geo.ipify.org/api/v2/country,city?apiKey=at_o6wJvZuxvDKTtBXgPugx5kZEhrbcN&ipAddress=${ip}`
+  );
+  const locationData = locationResponse?.data;
+  const { city, region, country } = locationData?.location;
+
+  // Get user's browser and device information based on User-Agent header
+  const parser = new UAParser();
+  const userAgent = req?.headers["user-agent"];
+  const result = parser?.setUA(userAgent).getResult();
+  const browserName = result?.browser.name;
+  const deviceName = result?.device?.vendor + " " + result?.device?.model;
+
+  let visit = {
     timestamp: new Date(),
-    ip: req.ip,
-    userAgent: req.headers["user-agent"],
-    browser: req.headers["user-agent"].split(" ")[0],
-    location: getVisitorLocation(req.ip), // Assuming you have a function that gets the visitor's location based on their IP address
-    device: getVisitorDevice(req.headers["user-agent"]), // Assuming you have a function that gets the visitor's device based on their user agent
+    ip,
+    browser: browserName,
+    device: deviceName,
+    location: `${country}, ${city}, ${region}`,
   };
 
   visits.push(visit);
-  await Visitors.findOne({ ip: req.ip }, (err, result) => {
-    if (err) {
-      console.log(err);
-      return;
-    }
-
-    if (!result) {
-      // If no record was found, insert a new record with the visitor's IP address
-      Visitors.insertOne({ ip: req.ip }, (err) => {
-        if (err) {
-          console.log(err);
-          return;
-        }
-
-        // Add the visitor to the set of active users and emit the updated set to all clients
-        activeUsers.add(req.ip);
-        io.emit("active-users", Array.from(activeUsers));
-      });
-    } else {
-      // If a record was found, do not add the visitor to the set of active users
-      console.log(
-        `Visitor with IP address ${req.ip} already exists in the database`
-      );
-    }
-  });
 
   // Emit a notification to the admin dashboard
-  io.emit("newVisit", visit);
+  io.on("connection", (socket) => {
+    var visitorId = socket.id;
+    var visitorIpAddress = socket.handshake.address;
+
+    socket.on("updateActivityStatus", (activityStatus) => {
+      visit.active = activityStatus;
+
+      io.emit("newVisit", visit);
+      console.log(visit);
+
+      // Update database record for visitor with visitorId to include activityStatus
+    });
+  });
+
+  // Listen for user activity events and update the activity status accordingly
+  let active = true;
+  const inactivityThreshold = 30000; // 30 seconds
+  let lastActivityTime = Date.now();
+
+  function updateUserActivity() {
+    const currentTime = Date.now();
+    const timeSinceLastActivity = currentTime - lastActivityTime;
+
+    if (timeSinceLastActivity > inactivityThreshold && active) {
+      active = false;
+      socket.emit("updateActivityStatus", false);
+    } else if (timeSinceLastActivity <= inactivityThreshold && !active) {
+      active = true;
+      socket.emit("updateActivityStatus", true);
+    }
+
+    setTimeout(updateUserActivity, 1000);
+  }
+
+  updateUserActivity();
+
+  // Listen for user activity events and update the lastActivityTime variable
+  const userActivityEvents = ["mousemove", "keydown", "click"];
+
+  function handleUserActivityEvent() {
+    lastActivityTime = Date.now();
+  }
+
+  userActivityEvents.forEach((event) => {
+    socket.on(event, handleUserActivityEvent);
+  });
 
   res.send({ msg: "Users Information", user: visit });
 });
 
-io.on("connection", (socket) => {
-  console.log("Client connected");
+// io.on("connection", (socket) => {
+//   console.log("Client connected");
 
-  socket.on("user-visit", (visitor) => {
-    activeUsers.add(visitor.id);
-    io.emit("active-users", Array.from(activeUsers));
-  });
+//   socket.on("user-visit", (visitor) => {
+//     activeUsers.add(visitor.id);
+//     io.emit("active-users", Array.from(activeUsers));
+//   });
 
-  socket.on("user-leave", (visitor) => {
-    activeUsers.delete(visitor.id);
-    io.emit("active-users", Array.from(activeUsers));
-  });
+//   socket.on("user-leave", (visitor) => {
+//     activeUsers.delete(visitor.id);
+//     io.emit("active-users", Array.from(activeUsers));
+//   });
 
-  socket.on("disconnect", () => {
-    console.log("Client disconnected");
-  });
-});
+//   socket.on("disconnect", () => {
+//     console.log("Client disconnected");
+//   });
+// });
 
 server.listen(PORT, async () => {
   await connect();
